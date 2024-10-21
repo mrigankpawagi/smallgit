@@ -1,197 +1,247 @@
 import os
-import sys
-import argparse
 import hashlib
+import argparse
 import json
-from datetime import datetime
+from typing import Union, List, Dict
+import pickle
 
-# Helper function to calculate the hash of a file's content.
-# This is similar to what Git does to track changes in files.
-def hash_file(filepath):
-    hasher = hashlib.sha1()
-    with open(filepath, 'rb') as f:
-        hasher.update(f.read())
-    return hasher.hexdigest()
+# Define types
+Blob = bytes
+Tree = Dict[str, Union['Tree', Blob]]
+Object = Union[Blob, Tree, 'Commit']
 
-# Function to save the current state of the repository.
-# This writes the repository data to a file so it can be loaded later.
-def save_state(repo_path, data):
-    with open(os.path.join(repo_path, '.smallgit', 'repo_state.json'), 'w') as f:
-        json.dump(data, f, indent=4)
+class Commit:
+    def __init__(self, parents: List['Commit'], author: str, message: str, snapshot: Tree):
+        """A commit consists of parents, metadata (author, message), and a snapshot (tree)."""
+        self.parents = parents 
+        self.author = author
+        self.message = message
+        self.snapshot = snapshot
 
-# Function to load the current state of the repository from disk.
-# This reads the repository data back into memory when we need it.
-def load_state(repo_path):
-    with open(os.path.join(repo_path, '.smallgit', 'repo_state.json'), 'r') as f:
-        return json.load(f)
+def sha1(data: Union[Blob, str]) -> str:
+    """Hash objects using SHA1."""
+    if isinstance(data, str):
+        data = data.encode()
+    return hashlib.sha1(data).hexdigest()
 
-# Initializes a new repository by creating a .smallgit directory.
-def init():
-    if os.path.exists(".smallgit"):
-        print("Repository already initialized.")
-    else:
-        os.makedirs(".smallgit")
-        # Setting up the basic structure for the repository
-        repo_data = {
-            "branches": {"main": []},  # A 'main' branch with no commits yet
-            "current_branch": "main",  # Start on the 'main' branch
-            "staging_area": {},        # Area to store files that are about to be committed
-            "commits": {}              # Dictionary to store all commits by their hash
-        }
-        save_state(".", repo_data)  # Save the initialized repository structure
-        print("Initialized empty SmallGit repository.")
-
-# Shows the status of the repository, including the current branch
-# and files that are staged for the next commit.
-def status():
-    repo_data = load_state(".")  # Load the current state of the repo
-    print(f"On branch {repo_data['current_branch']}")
+def store(obj: Object) -> str:
+    """Store an object and return its ID."""
+    obj_data = pickle.dumps(obj)
     
-    # Check if there are files in the staging area
-    if repo_data["staging_area"]:
-        print("Changes to be committed:")
-        for file in repo_data["staging_area"]:
-            print(f"  {file}")
-    else:
-        print("No changes to be committed.")
+    obj_id = sha1(obj_data)  # Compute SHA-1 hash of the object
+    
+    # Store the object in the `.smallgit/objects` directory
+    obj_path = f".smallgit/objects/{obj_id}"
 
-# Adds files to the staging area.
-# Staging files means we are preparing them to be committed in the next step.
-def add(files):
-    repo_data = load_state(".")  # Load the repository data
-    for file in files:
-        if os.path.exists(file):  # Check if the file exists
-            file_hash = hash_file(file)  # Calculate the hash of the file
-            repo_data["staging_area"][file] = file_hash  # Add it to the staging area
-            print(f"Added {file} to staging area.")
-        else:
-            print(f"File {file} not found.")
-    save_state(".", repo_data)  # Save the updated state after adding files
+    with open(obj_path, "wb") as f:
+        f.write(obj_data)
 
-# Commits the staged changes by saving them to the repository with a message.
-def commit(message):
-    repo_data = load_state(".")  # Load the current state of the repository
+    return obj_id
 
-    # If no files are staged, there is nothing to commit
-    if not repo_data["staging_area"]:
-        print("No changes to commit.")
+def load(obj_id: str) -> Object:
+    """Load an object by its ID."""
+    if os.path.exists(f".smallgit/objects/{obj_id}"):
+        with open(f".smallgit/objects/{obj_id}", "rb") as f:
+            obj_data = f.read()
+        
+        if obj_id == sha1(obj_data):
+            return pickle.loads(obj_data)                
+        
+        raise ValueError("Corrupted object data")
+    
+    raise FileNotFoundError("Object not found")
+
+def create_blob(file_content: str) -> str:
+    """Create and store a blob from file content (as a string)."""
+    blob = file_content.encode()
+    blob_id = store(blob)
+    return blob_id
+
+def create_tree(entries: Dict[str, Union[Blob, Tree]]) -> str:
+    """Create and store a tree (directory structure)."""
+    tree = entries
+    tree_id = store(tree)
+    return tree_id
+
+def create_commit(parents: List[Commit], author: str, message: str, snapshot: Tree) -> str:
+    """Create and store a commit object."""
+    commit = Commit(parents, author, message, snapshot)
+    commit_id = store(commit)
+    return commit_id
+
+def init():
+    """Initialize a SmallGit repository."""
+    if os.path.exists(".smallgit"):
+        print("SmallGit repository already exists.")
         return
     
-    # Create a unique hash for the commit, including the message and timestamp
-    commit_hash = hashlib.sha1(f"{message}{datetime.now()}".encode()).hexdigest()
+    os.makedirs(".smallgit")
+    os.makedirs(".smallgit/objects")
+    os.makedirs(".smallgit/refs/heads")
+    with open(".smallgit/HEAD", "w") as f:
+        f.write("ref: refs/heads/main")  # Initial branch is 'main'
     
-    # Record the commit details, including message and changes (staged files)
-    commit_data = {
-        "message": message,
-        "timestamp": str(datetime.now()),
-        "changes": repo_data["staging_area"].copy()  # Copy current staged files
-    }
+    print("SmallGit repository initialized.")
 
-    # Add the commit to the current branch
-    current_branch = repo_data["current_branch"]
-    repo_data["commits"][commit_hash] = commit_data
-    repo_data["branches"][current_branch].append(commit_hash)  # Link commit to branch
-    repo_data["staging_area"] = {}  # Clear the staging area after committing
-    save_state(".", repo_data)  # Save the updated repository state
+def get_current_branch():
+    """Get the current branch by reading the .smallgit/HEAD file."""
+    with open(".smallgit/HEAD", "r") as f:
+        ref = f.read().strip()
+    return ref.split(": ")[1].split("/")[-1]  # Extract branch name
+
+def add(files):
+    """Stage files as blobs for commit."""
+    index = {}
+    for file in files:
+        # 'file' can be a file path or a directory path (to add all files in the directory)
+        if os.path.isdir(file):
+            for root, _, filenames in os.walk(file):
+                for filename in filenames:
+                    filepath = os.path.join(root, filename)
+                    with open(filepath, "r") as f:
+                        content = f.read()
+                    blob_id = create_blob(content)
+                    index[filepath] = blob_id
+        else:      
+            if os.path.exists(file):
+                with open(file, "r") as f:
+                    content = f.read()
+                blob_id = create_blob(content)  # Create blob for file content
+                index[file] = blob_id  # Track the blob ID for each file
+            else:
+                print(f"File '{file}' not found.")
+                return
     
-    # Print a success message including the first few characters of the commit hash
-    print(f"[{commit_hash[:7]}] {message}")
+    # Save the index (staging area) to a file
+    with open(".smallgit/index", "w") as index_file:
+        index_file.write(json.dumps(index))  # Store the staged files (blobs)
 
-# Displays the history of commits (logs) for the current branch.
+    print(f"Staged files: {', '.join(files)}")
+
+def commit(message):
+    """Commit the staged files."""
+    if not os.path.exists(".smallgit/index"):
+        print("Nothing to commit.")
+        return
+    
+    # Read the index (staged files)
+    with open(".smallgit/index", "r") as index_file:
+        staged_files = json.loads(index_file.read())
+    
+    # Create a tree (snapshot) from the staged files
+    snapshot_tree = {filename: load(blob_id) for filename, blob_id in staged_files.items()}
+    
+    # Get the current branch and any parent commit
+    branch = get_current_branch()
+    parent_commit = None
+    if os.path.exists(f".smallgit/refs/heads/{branch}"):
+        with open(f".smallgit/refs/heads/{branch}", "r") as f:
+            parent_commit_id = f.read().strip()
+            parent_commit = load(parent_commit_id)
+
+    # Create the new commit object
+    new_commit_id = create_commit(
+        parents=[parent_commit] if parent_commit else [],
+        author="Mrigank <mrigankp@iisc.ac.in>",
+        message=message,
+        snapshot=snapshot_tree
+    )
+
+    # Update the branch reference with the new commit ID
+    with open(f".smallgit/refs/heads/{branch}", "w") as f:
+        f.write(new_commit_id)
+    
+    # Clear the index (staging area)
+    os.remove(".smallgit/index")
+
+    print(f"Committed with message: {message} (Commit ID: {new_commit_id[:7]})")
+
+def status():
+    """Show the status of the working directory."""
+    if os.path.exists(".smallgit/index"):
+        print("Changes staged for commit:")
+        with open(".smallgit/index", "r") as index_file:
+            staged_files = json.loads(index_file.read())
+            for filename in staged_files:
+                print(f"\t{filename}")
+    else:
+        print("No changes staged for commit.")
+
 def log():
-    repo_data = load_state(".")  # Load the current repository state
-    current_branch = repo_data["current_branch"]  # Get the current branch name
+    """Show the commit history of the current branch."""
+    branch = get_current_branch()
+    if not os.path.exists(f".smallgit/refs/heads/{branch}"):
+        print(f"No commits on branch '{branch}'.")
+        return
 
-    # Check if there are commits in the branch
-    if repo_data["branches"][current_branch]:
-        print(f"Commit history for branch {current_branch}:")
-        for commit_hash in reversed(repo_data["branches"][current_branch]):
-            commit = repo_data["commits"][commit_hash]
-            print(f"commit {commit_hash}")
-            print(f"Author: You <you@example.com>")  # A placeholder author
-            print(f"Date: {commit['timestamp']}")
-            print(f"\n    {commit['message']}\n")
-    else:
-        print("No commits yet on this branch.")
+    commit_id = ""
+    with open(f".smallgit/refs/heads/{branch}", "r") as f:
+        commit_id = f.read().strip()
 
-# Switch to a different branch or checkout a specific commit.
-def checkout(branch_or_commit):
-    repo_data = load_state(".")  # Load the repository state
-
-    # Check if it's a branch or a commit
-    if branch_or_commit in repo_data["branches"]:
-        repo_data["current_branch"] = branch_or_commit  # Switch to the branch
-        print(f"Switched to branch '{branch_or_commit}'")
-    elif branch_or_commit in repo_data["commits"]:
-        print(f"Checked out commit {branch_or_commit}")  # Checkout specific commit
-    else:
-        print(f"Branch or commit {branch_or_commit} not found.")
-    
-    save_state(".", repo_data)  # Save the updated repository state
-
-# Compares the current files to the staging area or between commits/branches.
-def diff(target=None):
-    repo_data = load_state(".")  # Load the repository state
-
-    if target:  # If a specific file is targeted
-        if target in repo_data["staging_area"]:
-            staged_hash = repo_data["staging_area"][target]  # Get the staged hash
-            current_hash = hash_file(target)  # Hash the current version of the file
-
-            # Compare the staged version with the current version
-            if current_hash != staged_hash:
-                print(f"File {target} has changed since it was staged.")
-            else:
-                print(f"No changes in {target}.")
+    # Traverse commit history and print log
+    while commit_id:
+        commit = load(commit_id)
+        print(f"Commit {commit_id[:7]} by {commit.author}")
+        print(f"\n    {commit.message}\n")
+        if commit.parents:
+            commit_id = store(commit.parents[0])  # Follow the first parent commit
         else:
-            print(f"File {target} is not staged.")
-    else:
-        # Compare all files in the staging area with the working directory
-        print("Comparing current files to staging area:")
-        for file in repo_data["staging_area"]:
-            staged_hash = repo_data["staging_area"][file]
-            current_hash = hash_file(file)
-            if current_hash != staged_hash:
-                print(f"{file} has changed.")
+            break
+
+def checkout(branch):
+    """Switch to the specified branch."""
+    if not os.path.exists(f".smallgit/refs/heads/{branch}"):
+        print(f"Branch '{branch}' does not exist.")
+        return
+    
+    with open(".smallgit/HEAD", "w") as f:
+        f.write(f"ref: refs/heads/{branch}")
+    
+    print(f"Switched to branch '{branch}'.")
+
+def diff():
+    """Show differences between the working directory and the staged area."""
+    if not os.path.exists(".smallgit/index"):
+        print("No changes to show.")
+        return
+    
+    print("Differences between staged and working directory:")
+    with open(".smallgit/index", "r") as index_file:
+        staged_files = json.loads(index_file.read())
+        for filename, blob_id in staged_files.items():
+            if os.path.exists(filename):
+                with open(filename, "r") as f:
+                    content = f.read()
+                working_blob_id = create_blob(content)
+                if working_blob_id != blob_id:
+                    print(f"\t{filename} has changed.")
             else:
-                print(f"No changes in {file}.")
+                print(f"\t{filename} is missing.")
 
-# Main function to set up the command-line interface (CLI) for SmallGit.
 def main():
-    parser = argparse.ArgumentParser(description="Simple Python SmallGit CLI")
+    """CLI Interface for SmallGit."""
+    parser = argparse.ArgumentParser(description="SmallGit: A Simple Git Implementation")
     
-    # Set up subcommands (init, status, add, commit, log, checkout, diff)
     subparsers = parser.add_subparsers(dest="command")
-    
-    # SmallGit init
-    subparsers.add_parser("init", help="Initialize a new repository")
 
-    # SmallGit status
+    subparsers.add_parser("init", help="Initialize a new repository")
     subparsers.add_parser("status", help="Show the status of the repository")
 
-    # SmallGit add
     add_parser = subparsers.add_parser("add", help="Add files to the staging area")
-    add_parser.add_argument("files", nargs="+", help="List of files to add")
+    add_parser.add_argument("files", nargs="+", help="Files to add")
 
-    # SmallGit commit
     commit_parser = subparsers.add_parser("commit", help="Commit the staged changes")
     commit_parser.add_argument("-m", "--message", required=True, help="Commit message")
 
-    # SmallGit log
     subparsers.add_parser("log", help="Show commit logs")
 
-    # SmallGit checkout
-    checkout_parser = subparsers.add_parser("checkout", help="Switch to a branch or commit")
-    checkout_parser.add_argument("branch_or_commit", help="Branch or commit to checkout")
+    checkout_parser = subparsers.add_parser("checkout", help="Switch branches")
+    checkout_parser.add_argument("branch", help="Branch to switch to")
 
-    # SmallGit diff
-    diff_parser = subparsers.add_parser("diff", help="Show differences between files")
-    diff_parser.add_argument("target", nargs="?", help="File to compare")
+    subparsers.add_parser("diff", help="Show differences between the working directory and the index")
 
-    # Parse the command-line arguments
     args = parser.parse_args()
 
-    # Call the appropriate function based on the command
     if args.command == "init":
         init()
     elif args.command == "status":
@@ -203,9 +253,9 @@ def main():
     elif args.command == "log":
         log()
     elif args.command == "checkout":
-        checkout(args.branch_or_commit)
+        checkout(args.branch)
     elif args.command == "diff":
-        diff(args.target)
+        diff()
     else:
         parser.print_help()
 

@@ -97,6 +97,8 @@ def add(files):
         if os.path.isdir(file):
             for root, _, filenames in os.walk(file):
                 for filename in filenames:
+                    if ".smallgit" in root:
+                        continue
                     filepath = os.path.join(root, filename)
                     with open(filepath, "r") as f:
                         content = f.read()
@@ -104,6 +106,9 @@ def add(files):
                     index[filepath] = blob_id
         else:      
             if os.path.exists(file):
+                # ignore files in .smallgit directory
+                if ".smallgit/" in file:
+                    continue
                 with open(file, "r") as f:
                     content = f.read()
                 blob_id = create_blob(content)  # Create blob for file content
@@ -129,7 +134,7 @@ def commit(message):
         staged_files = json.loads(index_file.read())
     
     # Create a tree (snapshot) from the staged files
-    snapshot_tree = {filename: load(blob_id) for filename, blob_id in staged_files.items()}
+    snapshot_tree = {filename: blob_id for filename, blob_id in staged_files.items()}
     
     # Get the current branch and any parent commit
     branch = get_current_branch()
@@ -154,7 +159,7 @@ def commit(message):
     # Clear the index (staging area)
     os.remove(".smallgit/index")
 
-    print(f"Committed with message: {message} (Commit ID: {new_commit_id[:7]})")
+    print(f"Committed with message: {message} (Commit ID: {new_commit_id})")
 
 def status():
     """Show the status of the working directory."""
@@ -162,10 +167,46 @@ def status():
         print("Changes staged for commit:")
         with open(".smallgit/index", "r") as index_file:
             staged_files = json.loads(index_file.read())
+            staged_file_items = list(staged_files.keys())
             for filename in staged_files:
                 print(f"\t{filename}")
     else:
         print("No changes staged for commit.")
+        staged_file_items = []
+
+    # changes not staged for commit (modified files)
+    print("\nChanges not staged for commit (modified files):")
+    for root, _, filenames in os.walk("."):
+        for filename in filenames:
+            filepath = os.path.join(root, filename)
+            if ".smallgit" in filepath:
+                continue
+
+            # the path string may differ due to OS differences or starting with './'
+            if filepath.startswith("./") or filepath.startswith(".\\"):
+                filepath = filepath[2:]
+
+            for staged_file in staged_file_items:
+                if staged_file.startswith("./") or staged_file.startswith(".\\"):
+                    staged_file = staged_file[2:]
+                if filepath == staged_file:
+                    break
+            else:
+                with open(filepath, "r") as f:
+                    content = f.read()
+                blob_id = create_blob(content)
+                
+                # Compare the blob ID with the blob ID in the HEAD commit
+                branch = get_current_branch()
+                if os.path.exists(f".smallgit/refs/heads/{branch}"):
+                    with open(f".smallgit/refs/heads/{branch}", "r") as f:
+                        commit_id = f.read().strip()
+                        commit = load(commit_id)
+                        snapshot_blob = commit.snapshot[filepath]
+                        if filepath in commit.snapshot and snapshot_blob != blob_id:
+                            print(f"\t{filepath}")
+                else:
+                    print(f"\t{filepath}") # all files are new
 
 def log():
     """Show the commit history of the current branch."""
@@ -181,23 +222,38 @@ def log():
     # Traverse commit history and print log
     while commit_id:
         commit = load(commit_id)
-        print(f"Commit {commit_id[:7]} by {commit.author}")
+        print(f"Commit {commit_id} by {commit.author}")
         print(f"\n    {commit.message}\n")
         if commit.parents:
             commit_id = store(commit.parents[0])  # Follow the first parent commit
         else:
             break
 
-def checkout(branch):
-    """Switch to the specified branch."""
-    if not os.path.exists(f".smallgit/refs/heads/{branch}"):
-        print(f"Branch '{branch}' does not exist.")
-        return
+def checkout(commit):
+    """
+    Switch to the specified commit.
+    Allow using 'HEAD' to switch to the latest commit on the current branch.
+    """
+    if commit == "HEAD":
+        branch = get_current_branch()
+        if os.path.exists(f".smallgit/refs/heads/{branch}"):
+            with open(f".smallgit/refs/heads/{branch}", "r") as f:
+                commit = f.read().strip()
+        else:
+            print(f"Branch '{branch}' does not exist.")
     
-    with open(".smallgit/HEAD", "w") as f:
-        f.write(f"ref: refs/heads/{branch}")
+    # Load the commit object
+    commit_obj = load(commit)
     
-    print(f"Switched to branch '{branch}'.")
+    # Restore the files from the commit snapshot
+    for filename, obj_id in commit_obj.snapshot.items():
+        content = load(obj_id).decode()
+        
+        os.makedirs("./" + os.path.dirname(filename), exist_ok=True)
+        with open(filename, "w") as f:
+            f.write(content)
+    
+    print(f"Switched to commit {commit}.")
 
 def diff():
     """Show differences between the working directory and the staged area."""
@@ -235,8 +291,8 @@ def main():
 
     subparsers.add_parser("log", help="Show commit logs")
 
-    checkout_parser = subparsers.add_parser("checkout", help="Switch branches")
-    checkout_parser.add_argument("branch", help="Branch to switch to")
+    checkout_parser = subparsers.add_parser("checkout", help="Switch to a commit")
+    checkout_parser.add_argument("commit", help="Commit to switch to")
 
     subparsers.add_parser("diff", help="Show differences between the working directory and the index")
 
@@ -253,7 +309,7 @@ def main():
     elif args.command == "log":
         log()
     elif args.command == "checkout":
-        checkout(args.branch)
+        checkout(args.commit)
     elif args.command == "diff":
         diff()
     else:
